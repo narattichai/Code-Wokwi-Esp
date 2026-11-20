@@ -1,0 +1,176 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHTesp.h>
+
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+
+const char* mqtt_server = "thingsboard.cloud";
+const int mqtt_port = 1883;
+const char* access_token = "hV24gm6aGOuyfOi1yPaM";
+
+const int DHT_PIN = 15;
+const int LED_TEMP_PIN = 2;   // LED แจ้งเตือนอุณหภูมิ
+const int LED_HUM_PIN = 4;    // LED แจ้งเตือนความชื้น
+const int LED_VALVE_PIN = 25; // LED วาล์วเปิด-ปิดช่องให้อาหาร
+const int LED_MOTOR_PIN = 26; // LED มอเตอร์ปั่นอาหาร
+
+// กำหนดช่วงค่าปกติ (หากอยู่นอกช่วงนี้ ไฟจะติดเพื่อแจ้งเตือน)
+const float TEMP_MIN = 28.0;
+const float TEMP_MAX = 32.0;
+
+const float HUM_MIN = 60.0;
+const float HUM_MAX = 75.0;
+
+// ตัวแปรจัดการเวลาแบบ Non-blocking (millis)
+unsigned long lastTelemetryTime = 0;
+const unsigned long telemetryInterval = 3000; // ส่งค่าเซนเซอร์ทุก 3 วินาที
+
+// สถานะการทำงานของระบบให้อาหาร
+enum FeedState {
+  VALVE_OPEN_ONLY, // วาล์วเปิดก่อน 1 วินาที
+  BOTH_RUNNING,    // วาล์วและมอเตอร์ทำงานพร้อมกัน 15 วินาที
+  COOLDOWN_WAIT    // ปิดทั้งคู่ พักรอ 20 วินาที
+};
+
+FeedState currentFeedState = VALVE_OPEN_ONLY;
+unsigned long feedStateStartTime = 0;
+
+DHTesp dhtSensor;
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+void setup_wifi() {
+  delay(10);
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Connecting to ThingsBoard...");
+    if (client.connect("WokwiESP32Client", access_token, NULL)) {
+      Serial.println("connected");
+    } else {
+      delay(3000);
+    }
+  }
+}
+
+// ฟังก์ชันจัดการลำดับการทำงานของวาล์วและมอเตอร์ให้อาหาร
+void handleFeedingProcess(unsigned long currentMillis) {
+  switch (currentFeedState) {
+    case VALVE_OPEN_ONLY:
+      // 1. วาล์วเปิด มอเตอร์ปิด (ทำงาน 1 วินาที)
+      digitalWrite(LED_VALVE_PIN, HIGH);
+      digitalWrite(LED_MOTOR_PIN, LOW);
+      
+      if (currentMillis - feedStateStartTime >= 1000) {
+        currentFeedState = BOTH_RUNNING;
+        feedStateStartTime = currentMillis;
+        Serial.println("[Feeding] Motor ON (15s)");
+      }
+      break;
+
+    case BOTH_RUNNING:
+      // 2. วาล์วเปิด + มอเตอร์เปิด (ทำงาน 15 วินาที)
+      digitalWrite(LED_VALVE_PIN, HIGH);
+      digitalWrite(LED_MOTOR_PIN, HIGH);
+      
+      if (currentMillis - feedStateStartTime >= 15000) {
+        currentFeedState = COOLDOWN_WAIT;
+        feedStateStartTime = currentMillis;
+        Serial.println("[Feeding] Valve & Motor OFF - Cooldown (20s)");
+      }
+      break;
+
+    case COOLDOWN_WAIT:
+      // 3. ปิดทั้งคู่พร้อมกัน หน่วงเวลา 20 วินาทีก่อนเริ่มรอบใหม่
+      digitalWrite(LED_VALVE_PIN, LOW);
+      digitalWrite(LED_MOTOR_PIN, LOW);
+      
+      if (currentMillis - feedStateStartTime >= 20000) {
+        currentFeedState = VALVE_OPEN_ONLY;
+        feedStateStartTime = currentMillis;
+        Serial.println("[Feeding] Cycle Restart -> Valve ON (1s)");
+      }
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_TEMP_PIN, OUTPUT);
+  pinMode(LED_HUM_PIN, OUTPUT);
+  pinMode(LED_VALVE_PIN, OUTPUT);
+  pinMode(LED_MOTOR_PIN, OUTPUT);
+
+  digitalWrite(LED_TEMP_PIN, LOW);
+  digitalWrite(LED_HUM_PIN, LOW);
+  digitalWrite(LED_VALVE_PIN, LOW);
+  digitalWrite(LED_MOTOR_PIN, LOW);
+
+  dhtSensor.setup(DHT_PIN, DHTesp::DHT22);
+
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+
+  // เริ่มต้นจับเวลาให้อาหารทันทีที่เปิดเครื่อง
+  feedStateStartTime = millis();
+  Serial.println("[Feeding] Cycle Start -> Valve ON (1s)");
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  unsigned long currentMillis = millis();
+
+  // อัปเดตการทำงานของวาล์วและมอเตอร์ตลอดเวลา
+  handleFeedingProcess(currentMillis);
+
+  // อ่านค่า DHT22 และส่งข้อมูลไป ThingsBoard ทุกๆ 3 วินาที
+  if (currentMillis - lastTelemetryTime >= telemetryInterval) {
+    lastTelemetryTime = currentMillis;
+
+    TempAndHumidity data = dhtSensor.getTempAndHumidity();
+    float temp = data.temperature;
+    float hum = data.humidity;
+
+    // ตรวจสอบเงื่อนไขแจ้งเตือน
+    bool tempAlert = (temp < TEMP_MIN || temp > TEMP_MAX || hum > HUM_MAX);
+    digitalWrite(LED_TEMP_PIN, tempAlert ? HIGH : LOW);
+
+    bool humAlert = (hum < HUM_MIN);
+    digitalWrite(LED_HUM_PIN, humAlert ? HIGH : LOW);
+
+    // อ่านสถานะปัจจุบันของวาล์วและมอเตอร์เพื่อส่งขึ้น Dashboard
+    bool valveStatus = (digitalRead(LED_VALVE_PIN) == HIGH);
+    bool motorStatus = (digitalRead(LED_MOTOR_PIN) == HIGH);
+
+    // สร้าง Payload ส่งไป ThingsBoard
+    char payload[192];
+    snprintf(payload, sizeof(payload),
+      "{\"temperature\":%.1f,\"humidity\":%.1f,\"tempLed\":%s,\"humLed\":%s,\"valveLed\":%s,\"motorLed\":%s,\"heartbeat\":%lu}",
+      temp, hum,
+      tempAlert ? "true" : "false",
+      humAlert ? "true" : "false",
+      valveStatus ? "true" : "false",
+      motorStatus ? "true" : "false",
+      currentMillis);
+
+    Serial.print("Publishing: ");
+    Serial.println(payload);
+
+    client.publish("v2/t", payload);
+    client.publish("v2/a", payload);
+  }
+}
